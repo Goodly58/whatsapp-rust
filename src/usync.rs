@@ -2454,17 +2454,54 @@ impl Client {
         } else {
             1
         };
+        let prefetched = if mode == DeviceListApplyMode::GroupRefresh {
+            self.prefetch_group_account_identities(&users).await?
+        } else {
+            None
+        };
         futures::stream::iter(users)
-            .map(|user| self.prepare_device_list_identity(user, mode))
+            .map(|user| self.prepare_device_list_identity(user, mode, prefetched.as_ref()))
             .buffered(concurrency)
             .try_collect()
             .await
+    }
+
+    /// Ask for every cold member's primary in one request, as fanout does for
+    /// devices: a thousand-member group otherwise waits on hundreds of round
+    /// trips before its first send. This only picks whom to ask; each member
+    /// still rechecks trust under its guards. A failed request aborts the
+    /// refresh, as a failed single lookup does.
+    async fn prefetch_group_account_identities(
+        &self,
+        users: &[Jid],
+    ) -> anyhow::Result<Option<crate::prekeys::PrefetchedAdvIdentities>> {
+        use futures::StreamExt;
+        // Owned rows keep this future Send behind the boxed refresh.
+        let cold: Vec<Jid> = futures::stream::iter(users.to_vec())
+            .map(|user| async move {
+                let cold = matches!(self.device_list_account_identity(&user).await, Ok(None));
+                cold.then(|| wacore::types::jid::adv_account_jid(&user))
+            })
+            .buffered(16)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        let mut seen = std::collections::HashSet::new();
+        let primaries: Vec<_> = cold
+            .into_iter()
+            .filter(|primary| seen.insert(primary.clone()))
+            .collect();
+        if primaries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.prefetch_adv_account_identities(primaries).await?))
     }
 
     async fn prepare_device_list_identity(
         &self,
         user: Jid,
         mode: DeviceListApplyMode,
+        prefetched: Option<&crate::prekeys::PrefetchedAdvIdentities>,
     ) -> anyhow::Result<(Jid, PreparedAccountIdentity)> {
         let cached = {
             let (_sessions, _mapping) = self
@@ -2474,7 +2511,10 @@ impl Client {
         };
         let identity = match cached {
             Ok(Some(identity)) => Ok(identity),
-            Ok(None) => self.ensure_adv_account_identity(&user).await,
+            Ok(None) => {
+                self.ensure_adv_account_identity_with(&user, prefetched)
+                    .await
+            }
             Err(error) => Err(error),
         };
         let prepared = match identity {

@@ -1949,6 +1949,18 @@ fn session_bundle(
 
 /// Encode a fictitious primary IQ response with a valid or corrupted prekey.
 fn primary_response(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary::Node {
+    primaries_response([primary_user(user, account, valid)])
+}
+
+fn primaries_response(users: impl IntoIterator<Item = wacore_binary::Node>) -> wacore_binary::Node {
+    NodeBuilder::new("iq")
+        .attr("type", "result")
+        .children([NodeBuilder::new("list").children(users).build()])
+        .build()
+}
+
+/// One fictitious primary's `<user>` bundle with a valid or corrupted prekey.
+fn primary_user(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary::Node {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     let signed = KeyPair::generate(&mut rng);
     let mut signature = account
@@ -1959,31 +1971,26 @@ fn primary_response(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary
     if !valid {
         signature[0] ^= 1;
     }
-    NodeBuilder::new("iq")
-        .attr("type", "result")
-        .children([NodeBuilder::new("list")
-            .children([NodeBuilder::new("user")
-                .attr("jid", user.to_string())
+    NodeBuilder::new("user")
+        .attr("jid", user.to_string())
+        .children([
+            NodeBuilder::new("registration")
+                .bytes(1234u32.to_be_bytes().to_vec())
+                .build(),
+            NodeBuilder::new("type").bytes(vec![5]).build(),
+            NodeBuilder::new("identity")
+                .bytes(account.public_key.public_key_bytes().to_vec())
+                .build(),
+            NodeBuilder::new("skey")
                 .children([
-                    NodeBuilder::new("registration")
-                        .bytes(1234u32.to_be_bytes().to_vec())
+                    NodeBuilder::new("id").bytes(vec![0, 0, 1]).build(),
+                    NodeBuilder::new("value")
+                        .bytes(signed.public_key.public_key_bytes().to_vec())
                         .build(),
-                    NodeBuilder::new("type").bytes(vec![5]).build(),
-                    NodeBuilder::new("identity")
-                        .bytes(account.public_key.public_key_bytes().to_vec())
-                        .build(),
-                    NodeBuilder::new("skey")
-                        .children([
-                            NodeBuilder::new("id").bytes(vec![0, 0, 1]).build(),
-                            NodeBuilder::new("value")
-                                .bytes(signed.public_key.public_key_bytes().to_vec())
-                                .build(),
-                            NodeBuilder::new("signature").bytes(signature).build(),
-                        ])
-                        .build(),
+                    NodeBuilder::new("signature").bytes(signature).build(),
                 ])
-                .build()])
-            .build()])
+                .build(),
+        ])
         .build()
 }
 
@@ -3633,29 +3640,40 @@ async fn stale_reverse_alias_cannot_supply_an_adv_primary() {
     client.signal_shutdown_sync();
 }
 
+/// A group's cold anchors share one request, as fanout prekeys do, so a large
+/// group's first send does not wait on a round trip per member. A member the
+/// reply omits or cannot authenticate keeps its stored devices; warm members
+/// are not asked about at all.
 #[tokio::test]
-async fn group_refresh_anchor_lookups_overlap_and_keep_the_unavailable_members_devices() {
+async fn group_refresh_asks_for_every_cold_anchor_at_once_and_keeps_failed_members_devices() {
     let (client, transport) = create_iq_test_client().await;
     let users: Vec<_> = (0..=crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY)
         .map(|i| Jid::pn(format!("1202555{:04}", 110 + i)))
         .collect();
-    let unavailable = &users[0];
-    client
-        .update_device_list(DeviceListRecord {
-            user: unavailable.user.as_str().into(),
-            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
-            raw_id: Some(1),
-            timestamp: 1,
-            phash: None,
-        })
-        .await
-        .unwrap();
+    let (unavailable, invalid) = (&users[0], &users[1]);
+    for user in [unavailable, invalid] {
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+    let warm = Jid::pn("12025550109");
+    crate::test_utils::seed_adv_primary(&client, &warm).await;
+    let members: Vec<_> = std::iter::once(warm.clone())
+        .chain(users.iter().cloned())
+        .collect();
     let refresh = {
         let client = client.clone();
-        let users = users.clone();
+        let members = members.clone();
         tokio::spawn(async move {
             let response = DeviceListResponse {
-                device_lists: users
+                device_lists: members
                     .iter()
                     .flat_map(|user| migration_response(user).device_lists)
                     .collect(),
@@ -3664,63 +3682,54 @@ async fn group_refresh_anchor_lookups_overlap_and_keep_the_unavailable_members_d
             client
                 .try_process_group_device_list_response(
                     &response,
-                    &users,
+                    &members,
                     client.device_topology.current(),
                 )
                 .await
         })
     };
-    for (chunk, window) in users
-        .chunks(crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY)
-        .enumerate()
-    {
-        let mut requests = vec![];
-        for offset in 0..window.len() {
-            let frame = chunk * crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY + offset;
-            let iq = decode_sent_iq(&transport, frame).await;
-            let node = iq.get();
-            let user = node
-                .get_optional_child("key")
-                .unwrap()
-                .get_optional_child("user")
-                .unwrap()
-                .attrs()
-                .optional_jid("jid")
-                .unwrap();
-            let id = node.attrs().optional_string("id").unwrap().into_owned();
-            requests.push((user, id));
-        }
-        // All requests in this window reached the transport before its first reply.
-        assert_eq!(
-            transport.sent_count(),
-            chunk * crate::prekeys::ADV_BOOTSTRAP_CONCURRENCY + window.len()
-        );
-        for (user, id) in requests.into_iter().rev() {
-            let reply = if user == *unavailable {
-                NodeBuilder::new("iq")
-                    .attr("type", "result")
-                    .children([NodeBuilder::new("list").build()])
-                    .build()
-            } else {
-                primary_response(&user, crate::test_utils::adv_test_account(), true)
-            };
-            answer_iq(&client, &id, &reply).await;
-        }
-    }
-    let devices = refresh.await.unwrap().unwrap().unwrap();
-    assert!(devices.contains(&unavailable.with_device(3)));
-    assert!(!devices.contains(&unavailable.with_device(7)));
-    assert!(
-        client
-            .cached_adv_account_identity(unavailable)
-            .await
-            .unwrap()
-            .is_none()
+    let iq = decode_sent_iq(&transport, 0).await;
+    let node = iq.get();
+    let requested: Vec<_> = node
+        .get_optional_child("key")
+        .unwrap()
+        .get_children_by_tag("user")
+        .map(|user| user.attrs().optional_jid("jid").unwrap())
+        .collect();
+    assert_eq!(requested, users);
+    let id = node.attrs().optional_string("id").unwrap().into_owned();
+    let account = crate::test_utils::adv_test_account();
+    let reply = primaries_response(
+        users[1..]
+            .iter()
+            .map(|user| primary_user(user, account, user != invalid)),
     );
-    for user in &users[1..] {
+    answer_iq(&client, &id, &reply).await;
+    let devices = refresh.await.unwrap().unwrap().unwrap();
+    for user in [unavailable, invalid] {
+        assert!(devices.contains(&user.with_device(3)));
+        assert!(!devices.contains(&user.with_device(7)));
+        assert!(
+            client
+                .cached_adv_account_identity(user)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for user in std::iter::once(&warm).chain(&users[2..]) {
         assert!(devices.contains(&user.with_device(7)));
     }
-    assert_eq!(transport.sent_count(), users.len());
+    for user in &users[2..] {
+        assert!(
+            client
+                .cached_adv_account_identity(user)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert_eq!(transport.sent_count(), 1);
     client.signal_shutdown_sync();
 }
 

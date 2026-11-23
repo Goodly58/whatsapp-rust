@@ -175,6 +175,35 @@ fn ensure_adv_bootstrap_scope(
     Ok(())
 }
 
+/// Cold primaries a group refresh authenticated in one request. A large group
+/// otherwise needs one round trip per member before its first send. The epoch
+/// precedes the request, as it does for a single lookup, and the batch is used
+/// only in the connection generation that fetched it.
+pub(crate) struct PrefetchedAdvIdentities {
+    generation: u64,
+    epoch: Option<u64>,
+    primaries: std::collections::HashMap<Jid, PrefetchedPrimary>,
+}
+
+enum PrefetchedPrimary {
+    Authenticated([u8; 32]),
+    Missing,
+    Invalid(anyhow::Error),
+}
+
+impl PrefetchedAdvIdentities {
+    /// `None` when the batch did not ask for this primary: the caller looks it up alone.
+    fn lookup(&self, primary: &Jid) -> Option<Result<[u8; 32], AdvPrimaryBundleError>> {
+        Some(match self.primaries.get(primary)? {
+            PrefetchedPrimary::Authenticated(key) => Ok(*key),
+            PrefetchedPrimary::Missing => Err(AdvPrimaryBundleError::Missing),
+            PrefetchedPrimary::Invalid(error) => {
+                Err(AdvPrimaryBundleError::Invalid(anyhow::anyhow!("{error:#}")))
+            }
+        })
+    }
+}
+
 /// Whether `upload_pre_keys` should upload, given the `force` flag and the server's
 /// reported pre-key count. The prekey-low path forces, matching WA Web's
 /// `handlePreKeyLow` which uploads unconditionally, so `force` bypasses the count guard.
@@ -366,6 +395,53 @@ impl Client {
         })
     }
 
+    /// Fetch and authenticate many cold primaries in one request, as a fanout
+    /// fetch does for devices, without installing any. Each primary still
+    /// becomes trusted through its own flight in `ensure_adv_account_identity_with`.
+    /// A bundle the reply omits or fails to authenticate affects only its primary.
+    pub(crate) async fn prefetch_adv_account_identities(
+        &self,
+        primaries: Vec<Jid>,
+    ) -> anyhow::Result<PrefetchedAdvIdentities> {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        let shutdown = self.connection_shutdown_signal();
+        let query = self.adv_bootstrap().queries.acquire().await;
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
+        let epoch = self.signal_cache.identity_continuity.primary_snapshot();
+        // Like a single lookup inside `ensure_adv_account_identity`, stop
+        // waiting when the connection closes rather than at the IQ timeout.
+        let mut response = futures::select_biased! {
+            _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
+                anyhow::bail!("connection closed during ADV bootstrap")
+            },
+            response = Box::pin(self.execute(PreKeyFetchSpec::new(primaries.clone()))).fuse() => {
+                response?
+            },
+        };
+        drop(query);
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
+        let primaries = primaries
+            .into_iter()
+            .map(|primary| {
+                let entry = match response.bundles.remove(&primary) {
+                    None => PrefetchedPrimary::Missing,
+                    Some(bundle) => match authenticated_primary_identity(&bundle) {
+                        Ok(identity) => PrefetchedPrimary::Authenticated(
+                            *identity.public_key().public_key_bytes(),
+                        ),
+                        Err(error) => PrefetchedPrimary::Invalid(error),
+                    },
+                };
+                (primary, entry)
+            })
+            .collect();
+        Ok(PrefetchedAdvIdentities {
+            generation,
+            epoch,
+            primaries,
+        })
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_pre_keys", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn fetch_pre_keys(
         &self,
@@ -490,10 +566,21 @@ impl Client {
     /// First contact uses the primary's signed prekey, just as a direct primary
     /// session does. Device-list blobs never rotate an already stored identity.
     pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+        self.ensure_adv_account_identity_with(jid, None).await
+    }
+
+    /// As `ensure_adv_account_identity`, but a leader takes the primary from
+    /// `prefetched` instead of its own request when the batch covered it.
+    pub(crate) async fn ensure_adv_account_identity_with(
+        &self,
+        jid: &Jid,
+        prefetched: Option<&PrefetchedAdvIdentities>,
+    ) -> anyhow::Result<[u8; 32]> {
         use wacore::types::jid::JidExt;
         let generation = self.connection_generation.load(Ordering::Acquire);
         let shutdown = self.connection_shutdown_signal();
         let primary = wacore::types::jid::adv_account_jid(jid);
+        let prefetched = prefetched.filter(|batch| batch.generation == generation);
         let bootstrap = async {
             ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
             {
@@ -513,7 +600,9 @@ impl Client {
                 match self.adv_bootstrap().claim(generation, &primary) {
                     Ok(lease) => {
                         let result = self
-                            .bootstrap_adv_account_identity(&primary, generation, &shutdown)
+                            .bootstrap_adv_account_identity(
+                                &primary, generation, &shutdown, prefetched,
+                            )
                             .await
                             .map_err(Arc::new);
                         ensure_adv_bootstrap_scope(
@@ -563,20 +652,29 @@ impl Client {
         primary: &Jid,
         generation: u64,
         shutdown: &wacore::runtime::ShutdownSignal,
+        prefetched: Option<&PrefetchedAdvIdentities>,
     ) -> anyhow::Result<[u8; 32]> {
         use wacore::types::jid::JidExt;
-        let query = self.adv_bootstrap().queries.acquire().await;
-        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
-        // A previous flight may have published while this caller waited for
-        // admission. No Signal lock is held across either admission or the IQ.
-        let cached = self.cached_adv_account_identity(primary).await?;
-        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
-        if let Some(identity) = cached {
-            return Ok(identity);
-        }
-        let epoch = self.signal_cache.identity_continuity.primary_snapshot();
-        let key = self.query_adv_account_identity(primary, None).await?;
-        drop(query);
+        let batched = prefetched.and_then(|batch| Some((batch.epoch, batch.lookup(primary)?)));
+        let (epoch, key) = match batched {
+            // The batch already authenticated this primary under its own epoch.
+            Some((epoch, key)) => (epoch, key?),
+            None => {
+                let query = self.adv_bootstrap().queries.acquire().await;
+                ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+                // A previous flight may have published while this caller waited for
+                // admission. No Signal lock is held across either admission or the IQ.
+                let cached = self.cached_adv_account_identity(primary).await?;
+                ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+                if let Some(identity) = cached {
+                    return Ok(identity);
+                }
+                let epoch = self.signal_cache.identity_continuity.primary_snapshot();
+                let key = self.query_adv_account_identity(primary, None).await?;
+                drop(query);
+                (epoch, key)
+            }
+        };
         let address = primary.to_protocol_address();
         let lock = self.session_lock_for(address.as_str()).await;
         let guard = lock.lock_arc().await;
