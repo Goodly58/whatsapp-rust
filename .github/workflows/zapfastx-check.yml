@@ -1,0 +1,23 @@
+# Throwaway: runs the library's unit tests on the ZapFastX pin
+# (719f294 plus #2077 and the batched anchors), which upstream's CI never sees.
+name: ZapFastX check
+on:
+  push:
+    branches: [zapfast-group-send-ci]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-nextest
+      - run: cargo nextest run --locked -p whatsapp-rust --lib --no-fail-fast
